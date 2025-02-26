@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Query, Response
 from langchain_community.document_loaders import WebBaseLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -20,6 +20,67 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+# Base predict.py template
+BASE_PREDICT_PY = """from typing import List, Optional
+from cog import BasePredictor, Input
+from transformers import T5ForConditionalGeneration, AutoTokenizer
+import torch
+ 
+CACHE_DIR = 'weights'
+ 
+# Shorthand identifier for a transformers model.
+# See https://huggingface.co/models?library=transformers for a list of models.
+MODEL_NAME = 'google/flan-t5-xl'
+ 
+class Predictor(BasePredictor):
+    def setup(self):
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.model = T5ForConditionalGeneration.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR, local_files_only=True)
+        self.model.to(self.device)
+        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR, local_files_only=True)
+ 
+    def predict(
+        self,
+        prompt: str = Input(description=f"Text prompt to send to the model."),
+        n: int = Input(description="Number of output sequences to generate", default=1, ge=1, le=5),
+        max_length: int = Input(
+            description="Maximum number of tokens to generate. A word is generally 2-3 tokens",
+            ge=1,
+            default=50
+        ),
+        temperature: float = Input(
+            description="Adjusts randomness of outputs, greater than 1 is random and 0 is deterministic, 0.75 is a good starting value.",
+            ge=0.01,
+            le=5,
+            default=0.75,
+        ),
+        top_p: float = Input(
+            description="When decoding text, samples from the top p percentage of most likely tokens; lower to ignore less likely tokens",
+            ge=0.01,
+            le=1.0,
+            default=1.0
+        ),
+        repetition_penalty: float = Input(
+            description="Penalty for repeated words in generated text; 1 is no penalty, values greater than 1 discourage repetition, less than 1 encourage it.",
+            ge=0.01,
+            le=5,
+            default=1
+        )
+        ) -> List[str]:
+        input = self.tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
+ 
+        outputs = self.model.generate(
+            input,
+            num_return_sequences=n,
+            max_length=max_length,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty
+        )
+        out = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        return out"""
 
 # Get API keys and environment variables
 def get_openai_api_key():
@@ -632,7 +693,181 @@ def extract_model_requirements(doc_url: str, parent_model: str) -> Dict[str, Any
         logger.error(f"Error in extract_model_requirements: {str(e)}")
         return get_fallback_requirements(parent_model)
 
-# Function to check script against requirements and amend if needed
+# Function to generate a customized predict.py script for a specific model
+def generate_predict_py(hf_model: str, parent_model: str, requirements: Dict[str, Any]) -> str:
+    # Use LLM to generate a customized predict.py script
+    generation_prompt = ChatPromptTemplate.from_template(
+        """
+        You are tasked with creating a predict.py file for a Hugging Face model to be used with the Cog framework.
+        
+        Model: {hf_model}
+        Parent Architecture: {parent_model}
+        
+        MODEL REQUIREMENTS:
+        - Required parameters: {required_params}
+        - Optional parameters: {optional_params}
+        - Special requirements: {special_requirements}
+        - Required methods: {methods}
+        - Input format requirements: {input_format}
+        
+        Below is a base predict.py template that you need to customize for the {hf_model} model:
+        
+        ```python
+        {base_template}
+        ```
+        
+        Please modify this template to:
+        1. Change MODEL_NAME to '{hf_model}'
+        2. Replace T5ForConditionalGeneration with the appropriate model class for {parent_model}
+        3. Update the tokenizer and model initialization code
+        4. Modify the parameters in the predict function to match those required by {parent_model}
+        5. Update the model.generate() call with parameters supported by {parent_model}
+        
+        Return ONLY the complete Python code without any explanations or markdown formatting.
+        The code must be production-ready with no placeholders or TODO comments.
+        """
+    )
+    
+    # Format requirements for the prompt
+    required_params_str = ", ".join(requirements["required_params"])
+    optional_params_str = str(requirements["optional_params"])
+    special_requirements_str = ", ".join(requirements["special_requirements"])
+    methods_str = ", ".join(requirements["methods"])
+    input_format_str = str(requirements["input_format"])
+    
+    # Get LLM with API key
+    llm = get_llm()
+    
+    chain = generation_prompt | llm
+    result = chain.invoke({
+        "hf_model": hf_model,
+        "parent_model": parent_model,
+        "required_params": required_params_str,
+        "optional_params": optional_params_str,
+        "special_requirements": special_requirements_str,
+        "methods": methods_str,
+        "input_format": input_format_str,
+        "base_template": BASE_PREDICT_PY
+    })
+    
+    # Extract just the code from the response
+    generated_script = result.content
+    
+    # If the response includes markdown code blocks, extract just the code
+    if "```python" in generated_script:
+        generated_script = re.search(r"```python\n(.*?)\n```", generated_script, re.DOTALL)
+        if generated_script:
+            generated_script = generated_script.group(1)
+    elif "```" in generated_script:
+        generated_script = re.search(r"```\n(.*?)\n```", generated_script, re.DOTALL)
+        if generated_script:
+            generated_script = generated_script.group(1)
+    
+    return generated_script
+
+@app.get("/health")
+async def health_check():
+    # Check if API keys and connections are configured
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    openai_status = "configured" if openai_key else "missing"
+    
+    mongodb_uri = os.environ.get("MONGODB_URI", "")
+    mongodb_status = "configured" if mongodb_uri else "missing"
+    
+    # Test MongoDB connection if URI is provided
+    mongo_connection = "untested"
+    if mongodb_uri:
+        try:
+            client = pymongo.MongoClient(mongodb_uri)
+            client.admin.command('ping')
+            mongo_connection = "connected"
+        except Exception as e:
+            mongo_connection = f"failed: {str(e)}"
+    
+    return {
+        "status": "healthy",
+        "openai_api": openai_status,
+        "mongodb_uri": mongodb_status,
+        "mongodb_connection": mongo_connection
+    }
+
+@app.post("/validate")
+async def validate_predict_script(
+    request_data: Dict[str, str] = Body(...)
+):
+    try:
+        hf_model = request_data.get("hf_model")
+        script = request_data.get("script")
+        
+        if not hf_model or not script:
+            raise HTTPException(status_code=400, detail="Both 'hf_model' and 'script' are required")
+        
+        # Step 1-2: Determine the parent model
+        parent_model = determine_parent_model(hf_model)
+        logger.info(f"Determined parent model: {parent_model}")
+        
+        # Step 3: Get documentation URL
+        doc_url = get_doc_url(parent_model)
+        logger.info(f"Using documentation URL: {doc_url}")
+        
+        # Step 4: Extract model requirements from documentation using vector store
+        try:
+            requirements = extract_model_requirements(doc_url, parent_model)
+            logger.info(f"Extracted requirements: {requirements}")
+        except Exception as e:
+            logger.warning(f"Failed to extract requirements from documentation: {str(e)}")
+            logger.info(f"Using fallback requirements for {parent_model}")
+            requirements = get_fallback_requirements(parent_model)
+        
+        # Steps 5-8: Validate and amend the script
+        amended_script = validate_and_amend_script(script, requirements, parent_model)
+        
+        # Return only the complete validated code
+        return amended_script
+        
+    except Exception as e:
+        logger.error(f"Error processing request: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+# New endpoint for GET requests to generate predict.py
+@app.get("/hf")
+async def generate_hf_predict_script(
+    model: str = Query(..., description="The Hugging Face model name")
+):
+    try:
+        logger.info(f"Generating predict.py for model: {model}")
+        
+        # Step 1: Determine the parent model
+        parent_model = determine_parent_model(model)
+        logger.info(f"Determined parent model: {parent_model}")
+        
+        # Step 2: Get documentation URL
+        doc_url = get_doc_url(parent_model)
+        logger.info(f"Using documentation URL: {doc_url}")
+        
+        # Step 3: Extract model requirements from documentation using vector store
+        try:
+            requirements = extract_model_requirements(doc_url, parent_model)
+            logger.info(f"Extracted requirements: {requirements}")
+        except Exception as e:
+            logger.warning(f"Failed to extract requirements from documentation: {str(e)}")
+            logger.info(f"Using fallback requirements for {parent_model}")
+            requirements = get_fallback_requirements(parent_model)
+        
+        # Step 4: Generate the custom predict.py script
+        predict_script = generate_predict_py(model, parent_model, requirements)
+        
+        # Return the script as plain text
+        return Response(
+            content=predict_script,
+            media_type="text/plain"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error generating predict.py: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Function to validate and amend a script
 def validate_and_amend_script(script: str, requirements: Dict[str, Any], parent_model: str) -> str:
     # Use LLM to validate and amend the script
     validation_prompt = ChatPromptTemplate.from_template(
@@ -811,70 +1046,6 @@ def validate_final_script(script: str, requirements: Dict[str, Any], parent_mode
         return validation_result[0]
     else:
         return {"valid": False, "issues": ["Failed to validate script properly"]}
-
-@app.get("/health")
-async def health_check():
-    # Check if API keys and connections are configured
-    openai_key = os.environ.get("OPENAI_API_KEY", "")
-    openai_status = "configured" if openai_key else "missing"
-    
-    mongodb_uri = os.environ.get("MONGODB_URI", "")
-    mongodb_status = "configured" if mongodb_uri else "missing"
-    
-    # Test MongoDB connection if URI is provided
-    mongo_connection = "untested"
-    if mongodb_uri:
-        try:
-            client = pymongo.MongoClient(mongodb_uri)
-            client.admin.command('ping')
-            mongo_connection = "connected"
-        except Exception as e:
-            mongo_connection = f"failed: {str(e)}"
-    
-    return {
-        "status": "healthy",
-        "openai_api": openai_status,
-        "mongodb_uri": mongodb_status,
-        "mongodb_connection": mongo_connection
-    }
-
-@app.post("/validate")
-async def validate_predict_script(
-    request_data: Dict[str, str] = Body(...)
-):
-    try:
-        hf_model = request_data.get("hf_model")
-        script = request_data.get("script")
-        
-        if not hf_model or not script:
-            raise HTTPException(status_code=400, detail="Both 'hf_model' and 'script' are required")
-        
-        # Step 1-2: Determine the parent model
-        parent_model = determine_parent_model(hf_model)
-        logger.info(f"Determined parent model: {parent_model}")
-        
-        # Step 3: Get documentation URL
-        doc_url = get_doc_url(parent_model)
-        logger.info(f"Using documentation URL: {doc_url}")
-        
-        # Step 4: Extract model requirements from documentation using vector store
-        try:
-            requirements = extract_model_requirements(doc_url, parent_model)
-            logger.info(f"Extracted requirements: {requirements}")
-        except Exception as e:
-            logger.warning(f"Failed to extract requirements from documentation: {str(e)}")
-            logger.info(f"Using fallback requirements for {parent_model}")
-            requirements = get_fallback_requirements(parent_model)
-        
-        # Steps 5-8: Validate and amend the script
-        amended_script = validate_and_amend_script(script, requirements, parent_model)
-        
-        # Return only the complete validated code
-        return amended_script
-        
-    except Exception as e:
-        logger.error(f"Error processing request: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
 
 # Use environment variable PORT for Cloud Run compatibility
 if __name__ == "__main__":

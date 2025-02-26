@@ -30,97 +30,34 @@ validate_replicate_format() {
     return 1
 }
 
-# Check if OpenAI API key is available
-check_openai_key() {
-    log "CONFIG" "Checking for OpenAI validation capability..."
-    
-    # No API key needed anymore
-    log "CONFIG" "OpenAI validation service available via HTTP endpoint"
-    echo "✅ OpenAI validation service available. Will validate model compatibility."
-    return 0
-}
-
-# Function to validate predict.py with OpenAI (via the new endpoint)
-validate_predict_with_openai() {
+# Function to fetch the predict.py file from the validation service
+fetch_predict_py() {
     local model="$1"
-    local script_content="$2"
     
-    log "OPENAI" "Starting validation of predict.py with OpenAI service..."
-    echo "🧠 Validating predict.py compatibility with model using OpenAI service..."
+    log "FETCH" "Fetching predict.py for model: $model"
+    echo "🧠 Fetching optimized predict.py for model: $model"
     
-    # Check if jq is installed
-    if ! command -v jq &> /dev/null; then
-        log "OPENAI" "Error: jq command not found. Please install jq to use OpenAI validation."
-        echo "❌ Error: jq command not found. Please install jq to use OpenAI validation."
-        return 1
-    fi
-    
-    # Properly escape the script content for JSON using jq
-    log "OPENAI" "JSON-escaping the script content..."
-    local escaped_script_content=$(jq -Rsa . <<< "$script_content")
-    log "OPENAI" "Script content escaped successfully"
-    
-    # Create the JSON payload
-    log "OPENAI" "Creating API request payload..."
-    local payload=$(cat <<EOF
-{
-    "hf_model": "$model",
-    "script": $escaped_script_content
-}
-EOF
-)
-
-    # Validate that the payload is valid JSON
-    if ! echo "$payload" | jq . > /dev/null 2>&1; then
-        log "OPENAI" "Error: Generated payload is not valid JSON"
-        echo "❌ Error: Generated payload is not valid JSON"
-        return 1
+    # Make the GET request to fetch the predict.py file
+    log "FETCH" "Making GET request to validation service..."
+    if curl -s -G "https://validate.fortunestold.co/hf" \
+            --data-urlencode "model=$model" \
+            --output "predict.py"; then
+        
+        # Check if the file was successfully downloaded and has content
+        if [ -s "predict.py" ]; then
+            log "FETCH" "Successfully downloaded predict.py"
+            echo "✅ Successfully downloaded predict.py file."
+            return 0
+        else
+            log "ERROR" "Downloaded predict.py is empty"
+            echo "❌ Error: Downloaded predict.py file is empty."
+            return 1
+        fi
     else
-        log "OPENAI" "Payload validated as valid JSON"
-    fi
-
-    # Make the API call to the validation service
-    log "OPENAI" "Making API call to validation service..."
-    local response=$(curl -s -X POST "https://cogcheck-299757569925.europe-west4.run.app/validate" \
-                     -H "Content-Type: application/json" \
-                     -d "$payload")
-    
-    # Check if curl was successful
-    if [ $? -ne 0 ]; then
-        log "OPENAI" "Error: curl command failed"
-        echo "❌ Error: curl command failed to connect to validation service"
+        log "ERROR" "Failed to download predict.py"
+        echo "❌ Error: Failed to download predict.py file."
         return 1
     fi
-    
-    log "OPENAI" "Received response from validation service, checking for errors..."
-    
-    # Check if the API call was successful
-    if echo "$response" | jq -e '.error' > /dev/null 2>&1; then
-        error_msg=$(echo "$response" | jq -r '.error')
-        log "OPENAI" "API error: $error_msg"
-        echo "❌ Validation service error: $error_msg"
-        return 1
-    fi
-    
-    # Extract the validated script
-    log "OPENAI" "Processing response from validation service..."
-    if ! echo "$response" | jq -e '.validated_script' > /dev/null 2>&1; then
-        log "OPENAI" "Error: Response does not contain expected content"
-        echo "❌ Failed to get a valid response from validation service."
-        return 1
-    fi
-    
-    MODIFIED_SCRIPT=$(echo "$response" | jq -r '.validated_script')
-    
-    if [[ -z "$MODIFIED_SCRIPT" ]]; then
-        log "OPENAI" "Failed to get a valid response (empty content)"
-        echo "❌ Failed to get a valid response from validation service (empty content)."
-        return 1
-    fi
-    
-    log "OPENAI" "Successfully received and processed validation service response"
-    echo "$MODIFIED_SCRIPT"
-    return 0
 }
 
 # Banner
@@ -131,15 +68,6 @@ echo "This script will help you deploy a Hugging Face model to Replicate."
 echo
 
 log "INIT" "Starting deployment assistant"
-
-# Check for OpenAI validation capability
-USE_OPENAI=false
-if check_openai_key; then
-    USE_OPENAI=true
-    log "INIT" "OpenAI validation enabled"
-else
-    log "INIT" "OpenAI validation disabled"
-fi
 
 # Step 1: Get HuggingFace model name
 log "INPUT" "Prompting for Hugging Face model name"
@@ -191,11 +119,6 @@ if [ -n "$HF_TOKEN" ]; then
 else
     echo "Using Hugging Face authentication: No"
 fi
-if [ "$USE_OPENAI" = true ]; then
-    echo "Using OpenAI validation: Yes"
-else
-    echo "Using OpenAI validation: No"
-fi
 echo "-------------------------"
 echo
 
@@ -236,9 +159,14 @@ predict: "predict.py:Predictor"
 EOL
 log "FILES" "Created cog.yaml"
 
-# Create initial predict.py with local_files_only=True
-log "FILES" "Creating predict.py"
-cat > predict.py << EOL
+# Fetch predict.py from the validation service
+log "FILES" "Fetching predict.py from validation service"
+if ! fetch_predict_py "$HF_MODEL"; then
+    log "WARNING" "Failed to fetch predict.py, creating a default version"
+    echo "⚠️ Failed to fetch predict.py, creating a default version instead."
+    
+    # Create a default predict.py file
+    cat > predict.py << EOL
 import os
 import torch
 from typing import Any, List
@@ -369,25 +297,9 @@ class Predictor(BasePredictor):
             print(f"Generated {output.shape[1] - inputs.input_ids.shape[1]} tokens.")
             return result
 EOL
-log "FILES" "Created predict.py with added logging"
-
-# If OpenAI validation is enabled, validate and update predict.py
-if [ "$USE_OPENAI" = true ]; then
-    log "OPENAI" "Starting OpenAI validation for predict.py"
-    echo "Validating predict.py with OpenAI service for model compatibility..."
-    PREDICT_CONTENT=$(cat predict.py)
-    log "OPENAI" "Sending predict.py content to validation service"
-    VALIDATED_CONTENT=$(validate_predict_with_openai "$HF_MODEL" "$PREDICT_CONTENT")
-    
-    if [ $? -eq 0 ] && [ ! -z "$VALIDATED_CONTENT" ]; then
-        log "OPENAI" "Validation succeeded, updating predict.py"
-        echo "✅ Successfully validated predict.py with OpenAI service."
-        echo "$VALIDATED_CONTENT" > predict.py
-        log "FILES" "Updated predict.py with validated content"
-    else
-        log "OPENAI" "Validation failed, keeping default predict.py"
-        echo "⚠️ Validation failed or returned empty content. Using default predict.py."
-    fi
+    log "FILES" "Created default predict.py"
+else
+    log "FILES" "Successfully fetched predict.py from validation service"
 fi
 
 # Create a modified download_weights script that doesn't rely on environment variables
