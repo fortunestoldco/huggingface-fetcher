@@ -117,25 +117,39 @@ def get_vector_store(collection_name="model_documentation"):
         db = client["model_docs_db"]
         collection = db[collection_name]
         
-        # Create a vector search index if it doesn't exist
-        # Check if index exists
-        indexes = collection.list_indexes()
+        # Check if the vector search index exists
+        existing_indexes = db.command({"listSearchIndexes": collection_name})
         vector_index_exists = False
-        for index in indexes:
-            if index.get("name") == "vector_index":
-                vector_index_exists = True
-                break
         
+        if "cursor" in existing_indexes and "firstBatch" in existing_indexes["cursor"]:
+            for index in existing_indexes["cursor"]["firstBatch"]:
+                if index.get("name") == "vector_index":
+                    vector_index_exists = True
+                    break
+        
+        # Create the vector search index if it doesn't exist
         if not vector_index_exists:
             logger.info("Creating vector search index on MongoDB collection")
-            collection.create_index(
-                [("embedding", "vectorSearch")],
-                name="vector_index",
-                vectorSearchOptions={
-                    "dimensions": 1536,  # Dimensionality of OpenAI embeddings
-                    "similarity": "cosine"
+            db.command({
+                "createSearchIndex": collection_name,
+                "name": "vector_index",
+                "definition": {
+                    "mappings": {
+                        "dynamic": True,
+                        "fields": {
+                            "embedding": {
+                                "type": "knnVector",
+                                "dimensions": 1536,
+                                "similarity": "cosine"
+                            },
+                            "metadata.parent_model": {
+                                "type": "string"
+                            }
+                        }
+                    }
                 }
-            )
+            })
+            logger.info("Vector search index created successfully")
         
         # Initialize the vector store
         embeddings = OpenAIEmbeddings(api_key=get_openai_api_key())
@@ -168,56 +182,93 @@ def determine_parent_model(hf_model: str) -> str:
         soup = BeautifulSoup(response.text, 'html.parser')
         page_text = soup.text.lower()
         
-        # Define patterns to check for parent models
-        parent_models = {
-            "llama": ["llama", "meta-llama", "meta llama"],
-            "llama2": ["llama-2", "llama 2"],
-            "llama3": ["llama-3", "llama 3"],
-            "mistral": ["mistral"],
-            "mixtral": ["mixtral"],
-            "gemini": ["gemini"],
-            "mpt": ["mpt"],
-            "imagegpt": ["imagegpt"],
-            "phi": ["phi"],
-            "falcon": ["falcon"],
-            "gemma": ["gemma"],
-            "gpt2": ["gpt2", "gpt-2"],
-            "gpt-j": ["gpt-j"],
-            "bert": ["bert"],
-            "t5": ["t5"],
-            "roberta": ["roberta"],
-            "opt": ["opt"]
-        }
+        # Handle specific model names directly first
+        if "mixtral" in hf_model.lower():
+            return "mixtral"
+        if "mistral" in hf_model.lower() and "mixtral" not in hf_model.lower():
+            return "mistral"
+        if "llama-3" in hf_model.lower() or "llama3" in hf_model.lower():
+            return "llama3"
+        if "llama-2" in hf_model.lower() or "llama2" in hf_model.lower():
+            return "llama2"
+        if "llama" in hf_model.lower() and not any(x in hf_model.lower() for x in ["llama2", "llama-2", "llama3", "llama-3"]):
+            return "llama"
         
-        # Check for parent model mentions
-        for model, patterns in parent_models.items():
+        # Check page content for model mentions - prioritize more specific models first
+        model_checks = [
+            ("mixtral", ["mixtral"]),
+            ("mistral", ["mistral"]),
+            ("llama3", ["llama 3", "llama-3"]),
+            ("llama2", ["llama 2", "llama-2"]),
+            ("llama", ["llama"]),
+            ("gemma", ["gemma"]),
+            ("phi", ["phi"]),
+            ("falcon", ["falcon"]),
+            ("gpt2", ["gpt2", "gpt-2"]),
+            ("gpt-j", ["gpt-j"]),
+            ("bert", ["bert"]),
+            ("t5", ["t5"]),
+            ("roberta", ["roberta"]),
+            ("opt", ["opt"]),
+            ("mpt", ["mpt"]),
+            ("imagegpt", ["imagegpt"])
+        ]
+        
+        # Check for explicit mentions in the page text
+        for model, patterns in model_checks:
             for pattern in patterns:
-                if pattern in page_text:
-                    # Special case for Llama versions
-                    if model == "llama":
-                        if "llama 3" in page_text or "llama-3" in page_text:
-                            return "llama3"
-                        elif "llama 2" in page_text or "llama-2" in page_text:
-                            return "llama2"
-                        else:
-                            return "llama"
+                if re.search(r'\b' + re.escape(pattern) + r'\b', page_text):
                     return model
         
-        # Extract model architecture info using LLM
+        # If still no match, extract model architecture using LLM
         llm = get_llm()
-        schema = {
-            "properties": {
-                "model_architecture": {"type": "string", "description": "The parent model or architecture of this model"}
-            },
-            "required": ["model_architecture"]
+        extraction_prompt = ChatPromptTemplate.from_template(
+            """
+            You are analyzing a Hugging Face model page for {model_name}.
+            
+            Based on the page content, determine the base architecture of this model.
+            Focus specifically on determining if it's a Mixtral, Mistral, Llama, Llama2, Llama3, 
+            BERT, GPT-2, T5, Falcon, Phi, Gemma, MPT, or other architecture.
+            
+            Be precise and distinguish carefully between Mixtral and Mistral, which are different architectures.
+            
+            Page content:
+            {page_content}
+            
+            Return ONLY the base architecture name, nothing else.
+            """
+        )
+        
+        chain = extraction_prompt | llm
+        result = chain.invoke({
+            "model_name": hf_model,
+            "page_content": page_text[:5000]  # Use first 5000 chars to avoid token limits
+        })
+        
+        # Clean up the result
+        architecture = result.content.lower().strip()
+        
+        # Map common variations to standard names
+        architecture_mapping = {
+            "mixtral": "mixtral",
+            "mistral": "mistral",
+            "llama 3": "llama3",
+            "llama-3": "llama3",
+            "llama3": "llama3",
+            "llama 2": "llama2",
+            "llama-2": "llama2",
+            "llama2": "llama2",
+            "llama": "llama"
         }
         
-        extraction_chain = create_extraction_chain(schema, llm)
-        extracted_data = extraction_chain.invoke(response.text)
-        if extracted_data and "model_architecture" in extracted_data[0]:
-            return extracted_data[0]["model_architecture"].lower()
+        for key, value in architecture_mapping.items():
+            if key in architecture:
+                return value
+        
+        # If all else fails
+        logger.warning(f"Could not definitively determine model architecture for {hf_model}. LLM suggested: {architecture}")
+        return architecture
             
-        return "unknown"
     except Exception as e:
         logger.error(f"Error determining parent model: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error determining parent model: {str(e)}")
