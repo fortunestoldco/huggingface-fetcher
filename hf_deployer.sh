@@ -37,25 +37,29 @@ fetch_predict_py() {
     log "FETCH" "Fetching predict.py for model: $model"
     echo "🧠 Fetching optimized predict.py for model: $model"
     
-    # Make the GET request to fetch the predict.py file
+    # Make the GET request and capture the response
     log "FETCH" "Making GET request to validation service..."
-    if curl -s -G "https://validate.fortunestold.co/hf" \
-            --data-urlencode "model=$model" \
-            --output "predict.py"; then
+    response=$(curl -s -G "https://validate.fortunestold.co/hf" \
+                  --data-urlencode "model=$model")
+    
+    # Check if curl was successful and if we got a response
+    if [ $? -eq 0 ] && [ -n "$response" ]; then
+        # Save the response to predict.py
+        echo "$response" > predict.py
         
-        # Check if the file was successfully downloaded and has content
+        # Check if the file was successfully saved and has content
         if [ -s "predict.py" ]; then
             log "FETCH" "Successfully downloaded predict.py"
-            echo "✅ Successfully downloaded predict.py file."
+            echo "✅ Successfully generated predict.py for $model"
             return 0
         else
-            log "ERROR" "Downloaded predict.py is empty"
-            echo "❌ Error: Downloaded predict.py file is empty."
+            log "ERROR" "Generated predict.py is empty"
+            echo "❌ Error: Generated predict.py file is empty."
             return 1
         fi
     else
-        log "ERROR" "Failed to download predict.py"
-        echo "❌ Error: Failed to download predict.py file."
+        log "ERROR" "Failed to generate predict.py"
+        echo "❌ Error: Failed to generate predict.py for $model"
         return 1
     fi
 }
